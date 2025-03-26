@@ -8,6 +8,8 @@ from streamlit_autorefresh import st_autorefresh
 import pytz
 import time
 import re
+import platform
+import os
 
 # ========== Global Notified Crossovers Tracker ==========
 notified_crossovers = {}
@@ -54,7 +56,7 @@ def detect_crossovers(df):
             crossover_points.append((df.index[i], df["close"].iloc[i], df["RSI"].iloc[i], "bearish"))
     return crossover_points
 
-# ========== Pushbullet Notifier ==========
+# ========== Notification System ==========
 def send_pushbullet_notification(title, body):
     api_key = st.secrets["pushbullet"]["api_key"]
     data_send = {"type": "note", "title": title, "body": body}
@@ -64,6 +66,18 @@ def send_pushbullet_notification(title, body):
         headers={'Access-Token': api_key, 'Content-Type': 'application/json'}
     )
     return resp.status_code
+
+def play_local_notification(title, body, repeat=3):
+    for _ in range(repeat):
+        if platform.system() == "Windows":
+            from plyer import notification
+            notification.notify(title=title, message=body, timeout=5)
+            os.system('echo "\a"')  # Basic beep
+        elif platform.system() == "Darwin":  # macOS
+            os.system(f"osascript -e 'display notification \"{body}\" with title \"{title}\"'")
+        elif platform.system() == "Linux":
+            os.system(f'notify-send "{title}" "{body}"')
+        time.sleep(1)
 
 # ========== Streamlit UI ==========
 st.set_page_config(page_title="EMA Crossover Monitor", layout="wide")
@@ -82,20 +96,23 @@ selected_timezone = pytz.timezone(timezones[selected_tz_label])
 now_local = pd.Timestamp.now(tz=selected_timezone)
 st.markdown(f"### 🕒 Current time ({selected_tz_label}): {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
 
-# Refresh every N seconds (e.g., 300 seconds = 5 minutes)
+# === Notification Options ===
+notif_type = st.radio("🔔 Notification type:", options=["Pushbullet", "Local"])
+notif_repeat = st.slider("🔁 Local notification repeat count:", min_value=1, max_value=5, value=3)
+
+# Refresh every N seconds
 interval_minutes = st.number_input("⏲️ Refresh interval (minutes)", min_value=1, max_value=60, value=5)
 st_autorefresh(interval=interval_minutes * 60 * 1000, key="refresh")
 
-# Notification test button
 if st.button("🔔 Notif Check"):
-    status = send_pushbullet_notification("🔔 Test Notification", "✅ This is a test push from your EMA monitor app.")
-    if status == 200:
-        st.success("Notification sent!")
+    if notif_type == "Pushbullet":
+        status = send_pushbullet_notification("🔔 Test Notification", "✅ This is a test push from your EMA monitor app.")
+        st.success("Notification sent!" if status == 200 else f"Failed with status code: {status}")
     else:
-        st.error("Failed to send notification. Status code: " + str(status))
+        play_local_notification("🔔 Test Notification", "✅ This is a test push from your EMA monitor app.", notif_repeat)
+        st.success("Local notification played!")
 
 all_markets = list_available_markets()
-
 selected_markets = st.multiselect("🪙 Select markets to monitor:", all_markets, default=["BTCUSDT", "ETHUSDT"])
 ema_short = st.number_input("Short EMA period", min_value=1, max_value=50, value=7)
 ema_long = st.number_input("Long EMA period", min_value=1, max_value=100, value=30)
@@ -110,24 +127,19 @@ for symbol in selected_markets:
         df = get_kline_data(symbol, interval=interval)
         df = calculate_emas(df, ema_short, ema_long)
 
-        # Classify candles based on volume threshold
         volume_threshold = df["volume"].quantile(0.75)
         df["is_long"] = df["volume"] >= volume_threshold
 
-        # Detect crossovers
         crossovers = detect_crossovers(df)
 
-        # Calculate candle interval time
         match = re.match(r"(\\d+)?(min|hour|day)", interval)
         unit_value = int(match.group(1)) if match and match.group(1) else 1
         unit_type = match.group(2) if match else "min"
         unit_map = {"min": 1, "hour": 60, "day": 1440}
         candle_minutes = unit_value * unit_map.get(unit_type, 1)
 
-        # Notification logic with memory
         total_minutes = candle_minutes + interval_minutes * 3
         time_window = pd.Timestamp.now(tz=selected_timezone) - pd.Timedelta(minutes=total_minutes)
-        notified_keys = []
 
         for ts, price, rsi, ctype in crossovers:
             if ts > time_window:
@@ -136,13 +148,13 @@ for symbol in selected_markets:
 
                 if notified_crossovers[key] < 2:
                     message = f"{symbol} - {ctype.title()} EMA crossover at {price:.2f} (RSI: {rsi:.2f}) at {ts.strftime('%H:%M:%S')}"
-                    send_pushbullet_notification("📊 EMA Crossover Alert", message)
+                    if notif_type == "Pushbullet":
+                        send_pushbullet_notification("📊 EMA Crossover Alert", message)
+                    else:
+                        play_local_notification("📊 EMA Crossover Alert", message, notif_repeat)
                     notified_crossovers[key] += 1
-                    notified_keys.append(key)
 
-        # Create figure
         fig = go.Figure()
-
         for i in range(len(df)):
             row = df.iloc[i]
             color = "green" if row["is_long"] else "red"
