@@ -11,8 +11,6 @@ import streamlit as st
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from streamlit_autorefresh import st_autorefresh
-from ta.trend import EMAIndicator, MACD
-
 
 # =================== Persistence ===================
 SETTINGS_FILE = "user_settings.json"
@@ -82,16 +80,9 @@ def get_kline_data(symbol, interval="5min", limit=200, _tz=pytz.UTC) -> pd.DataF
 
 # =================== Indicators / Signals ===================
 def calculate_emas(df, short_window, long_window):
-    # EMAs
     df["EMA_short"] = EMAIndicator(df["close"], window=short_window).ema_indicator()
     df["EMA_long"]  = EMAIndicator(df["close"], window=long_window).ema_indicator()
-    # RSI (14)
-    df["RSI"] = RSIIndicator(close=df["close"], window=14).rsi()
-    # MACD (12, 26, 9) — standard settings
-    macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
-    df["MACD"]        = macd.macd()
-    df["MACD_signal"] = macd.macd_signal()
-    df["MACD_hist"]   = macd.macd_diff()
+    df["RSI"]       = RSIIndicator(close=df["close"], window=14).rsi()
     return df
 
 def detect_crossovers(df):
@@ -244,9 +235,7 @@ for symbol in selected_markets:
         ema_s = float(df["EMA_short"].iloc[-1])
         ema_l = float(df["EMA_long"].iloc[-1])
         rsi   = float(df["RSI"].iloc[-1])
-        macd_val   = float(df["MACD"].iloc[-1])
-        macd_sig   = float(df["MACD_signal"].iloc[-1])
-        macd_hist  = float(df["MACD_hist"].iloc[-1])
+
         last_ts = None
         last_type = "-"
         alerts_sent = 0
@@ -279,9 +268,6 @@ for symbol in selected_markets:
             f"EMA {ema_short}": ema_s,
             f"EMA {ema_long}": ema_l,
             "RSI": rsi,
-            "MACD": macd_val,
-            "MACD Signal": macd_sig,
-            "MACD Hist": macd_hist,
             "Last Crossover": last_ts.strftime('%Y-%m-%d %H:%M') if last_ts else "-",
             "Type": last_type.title() if last_type != "-" else "-",
             "Alerts Sent": alerts_sent,
@@ -319,9 +305,6 @@ if not summary_df.empty:
                 f"EMA {ema_short}": "{:.6f}",
                 f"EMA {ema_long}": "{:.6f}",
                 "RSI": "{:.2f}",
-                "MACD": "{:.4f}",
-                "MACD Signal": "{:.4f}",
-                "MACD Hist": "{:.4f}",
             })
     )
 

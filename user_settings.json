@@ -4,7 +4,8 @@
     "CWIFUSDT",
     "BROCCOLIUSDT",
     "BOOPUSDT",
-    "CAMPUSDT"
+    "CAMPUSDT",
+    "ZEREBROUSDT"
   ],
   "ema_short": 7,
   "ema_long": 30,
@@ -13,12 +14,5 @@
   "notif_type": "Local",
   "notif_sound_repeat": 1,
   "max_alerts_per_cross": 2,
-  "refresh_minutes": 2,
-  "row_order": {
-    "SEIBTC": 1,
-    "CWIFUSDT": 2,
-    "BROCCOLIUSDT": 3,
-    "BOOPUSDT": 4,
-    "CAMPUSDT": 5
-  }
+  "refresh_minutes": 2
 }
