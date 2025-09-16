@@ -1,0 +1,24 @@
+{
+  "selected_markets": [
+    "SEIBTC",
+    "CWIFUSDT",
+    "BROCCOLIUSDT",
+    "BOOPUSDT",
+    "CAMPUSDT"
+  ],
+  "ema_short": 7,
+  "ema_long": 30,
+  "interval": "5min",
+  "timezone": "Tehran",
+  "notif_type": "Local",
+  "notif_sound_repeat": 1,
+  "max_alerts_per_cross": 2,
+  "refresh_minutes": 2,
+  "row_order": {
+    "SEIBTC": 1,
+    "CWIFUSDT": 2,
+    "BROCCOLIUSDT": 3,
+    "BOOPUSDT": 4,
+    "CAMPUSDT": 5
+  }
+}

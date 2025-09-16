@@ -3,6 +3,7 @@ import re
 import json
 import time
 import platform
+import pathlib
 import requests
 import pandas as pd
 import pytz
@@ -10,6 +11,8 @@ import streamlit as st
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from streamlit_autorefresh import st_autorefresh
+from ta.trend import EMAIndicator, MACD
+
 
 # =================== Persistence ===================
 SETTINGS_FILE = "user_settings.json"
@@ -45,7 +48,8 @@ def save_settings_from_state():
 _saved = load_settings()
 
 # =================== App state ===================
-notified_crossovers = {}
+if "seen_crossovers" not in st.session_state:
+    st.session_state["seen_crossovers"] = {}  # key -> True once notified
 
 # =================== CoinEx API ===================
 @st.cache_data(show_spinner=False, ttl=600)
@@ -66,8 +70,11 @@ def get_kline_data(symbol, interval="5min", limit=200, _tz=pytz.UTC) -> pd.DataF
         data,
         columns=["timestamp", "open", "high", "low", "close", "volume", "amount"]
     )
-    # time & types
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s").dt.tz_localize("UTC").dt.tz_convert(_tz)
+    df["timestamp"] = (
+        pd.to_datetime(df["timestamp"], unit="s")
+          .dt.tz_localize("UTC")
+          .dt.tz_convert(_tz)
+    )
     df.set_index("timestamp", inplace=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -75,9 +82,16 @@ def get_kline_data(symbol, interval="5min", limit=200, _tz=pytz.UTC) -> pd.DataF
 
 # =================== Indicators / Signals ===================
 def calculate_emas(df, short_window, long_window):
+    # EMAs
     df["EMA_short"] = EMAIndicator(df["close"], window=short_window).ema_indicator()
     df["EMA_long"]  = EMAIndicator(df["close"], window=long_window).ema_indicator()
-    df["RSI"]       = RSIIndicator(close=df["close"], window=14).rsi()
+    # RSI (14)
+    df["RSI"] = RSIIndicator(close=df["close"], window=14).rsi()
+    # MACD (12, 26, 9) — standard settings
+    macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["MACD"]        = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
+    df["MACD_hist"]   = macd.macd_diff()
     return df
 
 def detect_crossovers(df):
@@ -109,18 +123,31 @@ def send_pushbullet_notification(title, body):
         return resp.status_code, resp.text
 
 def play_local_notification(title, body, repeat=3):
+    base = pathlib.Path(__file__).parent
+    mp3_path = base / "notifSound.mp3"  # your MP3 file in the same folder
     for _ in range(repeat):
+        # Toast/notification
         if platform.system() == "Windows":
             try:
                 from plyer import notification
                 notification.notify(title=title, message=body, timeout=5)
             except Exception:
                 pass
-            os.system('echo "\a"')
-        elif platform.system() == "Darwin":
+        elif platform.system() == "Darwin":  # macOS
             os.system(f"osascript -e 'display notification \"{body}\" with title \"{title}\"'")
         elif platform.system() == "Linux":
             os.system(f'notify-send "{title}" "{body}"')
+        # Sound
+        if mp3_path.exists():
+            try:
+                import pygame
+                pygame.mixer.init()
+                pygame.mixer.music.load(str(mp3_path))
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"Error playing MP3: {e}")
         time.sleep(1)
 
 # =================== UI ===================
@@ -146,22 +173,27 @@ st.markdown(f"**🕒 Current time ({selected_tz_label})**: {now_local.strftime('
 colA, colB, colC = st.columns([1,1,1])
 with colA:
     notif_default = _saved.get("notif_type", "Local")
-    notif_type = st.radio("🔔 Notification type:", ["Local", "Pushbullet"],
-                          index=0 if notif_default=="Local" else 1,
-                          key="notif_type", on_change=save_settings_from_state)
+    notif_type = st.radio(
+        "🔔 Notification type:", ["Local", "Pushbullet"],
+        index=0 if notif_default == "Local" else 1,
+        key="notif_type", on_change=save_settings_from_state
+    )
 with colB:
-    max_alerts_per_cross = st.slider("Max alerts per crossover", 1, 5,
-                                     _saved.get("max_alerts_per_cross", 2),
-                                     key="max_alerts_per_cross", on_change=save_settings_from_state)
+    max_alerts_per_cross = st.slider(
+        "Max alerts per crossover", 1, 5, _saved.get("max_alerts_per_cross", 2),
+        key="max_alerts_per_cross", on_change=save_settings_from_state
+    )
 with colC:
-    notif_sound_repeat = st.slider("Local sound repeats", 1, 5,
-                                   _saved.get("notif_sound_repeat", 3),
-                                   key="notif_sound_repeat", on_change=save_settings_from_state)
+    notif_sound_repeat = st.slider(
+        "Local sound repeats", 1, 5, _saved.get("notif_sound_repeat", 3),
+        key="notif_sound_repeat", on_change=save_settings_from_state
+    )
 
 # Auto-refresh
-interval_minutes = st.number_input("⏲️ Auto-refresh every (minutes)", 1, 60,
-                                   _saved.get("refresh_minutes", 5),
-                                   key="interval_minutes", on_change=save_settings_from_state)
+interval_minutes = st.number_input(
+    "⏲️ Auto-refresh every (minutes)", 1, 60, _saved.get("refresh_minutes", 5),
+    key="interval_minutes", on_change=save_settings_from_state
+)
 st_autorefresh(interval=interval_minutes * 60 * 1000, key="refresh")
 
 # Test notif
@@ -174,18 +206,21 @@ if st.button("🔔 Notif Check"):
 
 # Inputs
 all_markets = list_available_markets()
-default_markets = [m for m in _saved.get("selected_markets", ["BTCUSDT","ETHUSDT"]) if m in all_markets]
-selected_markets = st.multiselect("🪙 Markets to monitor", all_markets, default=default_markets,
-                                  key="selected_markets", on_change=save_settings_from_state)
+default_markets = [m for m in _saved.get("selected_markets", ["BTCUSDT", "ETHUSDT"]) if m in all_markets]
+selected_markets = st.multiselect(
+    "🪙 Markets to monitor", all_markets, default=default_markets,
+    key="selected_markets", on_change=save_settings_from_state
+)
 ema_short = st.number_input("Short EMA", 1, 50, _saved.get("ema_short", 7),
                             key="ema_short", on_change=save_settings_from_state)
 ema_long  = st.number_input("Long EMA", 1, 200, _saved.get("ema_long", 30),
                             key="ema_long", on_change=save_settings_from_state)
-interval  = st.selectbox("📏 Candle interval",
-                         ["1min","5min","15min","30min","1hour","4hour","1day"],
-                         index=["1min","5min","15min","30min","1hour","4hour","1day"].index(
-                             _saved.get("interval", "5min")),
-                         key="interval", on_change=save_settings_from_state)
+interval  = st.selectbox(
+    "📏 Candle interval",
+    ["1min","5min","15min","30min","1hour","4hour","1day"],
+    index=["1min","5min","15min","30min","1hour","4hour","1day"].index(_saved.get("interval", "5min")),
+    key="interval", on_change=save_settings_from_state
+)
 
 # =================== Table (no charts) ===================
 records = []
@@ -196,7 +231,7 @@ unit_value = int(m.group(1)) if m and m.group(1) else 1
 unit_type  = m.group(2) if m else "min"
 unit_map   = {"min":1, "hour":60, "day":1440}
 candle_minutes = unit_value * unit_map.get(unit_type, 1)
-window_minutes = candle_minutes + interval_minutes*3
+window_minutes = candle_minutes + interval_minutes * 3
 recent_window  = pd.Timestamp.now(tz=selected_timezone) - pd.Timedelta(minutes=window_minutes)
 
 for symbol in selected_markets:
@@ -208,22 +243,35 @@ for symbol in selected_markets:
         last_close = float(df["close"].iloc[-1])
         ema_s = float(df["EMA_short"].iloc[-1])
         ema_l = float(df["EMA_long"].iloc[-1])
-        rsi    = float(df["RSI"].iloc[-1])
+        rsi   = float(df["RSI"].iloc[-1])
+        macd_val   = float(df["MACD"].iloc[-1])
+        macd_sig   = float(df["MACD_signal"].iloc[-1])
+        macd_hist  = float(df["MACD_hist"].iloc[-1])
+        last_ts = None
+        last_type = "-"
+        alerts_sent = 0
+        status_flag = "OK"
+        key = None
 
-        last_ts = None; last_type = "-"; alerts_sent = 0; status_flag = "OK"
         if cross:
             last_ts, last_price, last_rsi, last_type = cross[-1]
-            key = f"{symbol}_{last_ts}_{last_type}"
-            alerts_sent = notified_crossovers.get(key, 0)
-            if last_ts > recent_window and alerts_sent < max_alerts_per_cross:
+            # stable key for this exact crossover
+            key = f"{symbol}|{last_ts.isoformat()}|{last_type}"
+            seen_before = st.session_state["seen_crossovers"].get(key, False)
+
+            if last_ts > recent_window:
                 status_flag = "ALERT"
-                msg = f"{symbol} - {last_type.title()} EMA crossover at {last_price:.6f} (RSI: {last_rsi:.2f}) at {last_ts.strftime('%H:%M:%S')}"
-                if notif_type == "Pushbullet":
-                    st.info("Pushbullet is disabled for now (only local notifs).")
-                else:
-                    play_local_notification("📊 EMA Crossover Alert", msg, notif_sound_repeat)
-                notified_crossovers[key] = alerts_sent + 1
-                alerts_sent += 1
+                if not seen_before:
+                    msg = (
+                        f"{symbol} - {last_type.title()} EMA crossover at "
+                        f"{last_price:.6f} (RSI: {last_rsi:.2f}) at {last_ts.strftime('%H:%M:%S')}"
+                    )
+                    if notif_type == "Pushbullet":
+                        st.info("Pushbullet is disabled for now (only local notifs).")
+                    else:
+                        play_local_notification("📊 EMA Crossover Alert", msg, notif_sound_repeat)
+                    # mark as seen so future reruns won't notify again
+                    st.session_state["seen_crossovers"][key] = True
 
         records.append({
             "Symbol": symbol,
@@ -231,10 +279,14 @@ for symbol in selected_markets:
             f"EMA {ema_short}": ema_s,
             f"EMA {ema_long}": ema_l,
             "RSI": rsi,
+            "MACD": macd_val,
+            "MACD Signal": macd_sig,
+            "MACD Hist": macd_hist,
             "Last Crossover": last_ts.strftime('%Y-%m-%d %H:%M') if last_ts else "-",
             "Type": last_type.title() if last_type != "-" else "-",
             "Alerts Sent": alerts_sent,
-            "Status": status_flag
+            "Status": status_flag,
+            "Seen Before": "Yes" if (key and st.session_state["seen_crossovers"].get(key, False)) else "No",
         })
     except Exception as e:
         st.error(f"Failed to load {symbol}: {e}")
@@ -245,20 +297,34 @@ if not summary_df.empty:
     def highlight_alert(row):
         if row.get("Status") == "ALERT":
             if row.get("Type") == "Bullish":
-                return ["background-color: #d4edda" for _ in row]  # green
+                return ["background-color: #d4edda" for _ in row]  # green row
             if row.get("Type") == "Bearish":
-                return ["background-color: #f8d7da" for _ in row]  # red
+                return ["background-color: #f8d7da" for _ in row]  # red row
         return ["" for _ in row]
 
-    st.dataframe(
-        summary_df.style.apply(highlight_alert, axis=1).format({
-            "Last Price":"{:.6f}",
-            f"EMA {ema_short}":"{:.6f}",
-            f"EMA {ema_long}":"{:.6f}",
-            "RSI":"{:.2f}"
-        }),
-        use_container_width=True,
-        height=420
+    def color_type_cell(v):
+        if v == "Bullish":
+            return "color: #2ecc71; font-weight: 600;"  # green text
+        if v == "Bearish":
+            return "color: #e74c3c; font-weight: 600;"  # red text
+        return ""
+
+    styled = (
+        summary_df
+            .style
+            .apply(highlight_alert, axis=1)               # row highlights
+            .applymap(color_type_cell, subset=["Type"])   # color only text in Type column
+            .format({
+                "Last Price": "{:.6f}",
+                f"EMA {ema_short}": "{:.6f}",
+                f"EMA {ema_long}": "{:.6f}",
+                "RSI": "{:.2f}",
+                "MACD": "{:.4f}",
+                "MACD Signal": "{:.4f}",
+                "MACD Hist": "{:.4f}",
+            })
     )
+
+    st.dataframe(styled, use_container_width=True, height=420)
 else:
     st.info("No markets selected.")
