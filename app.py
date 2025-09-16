@@ -311,6 +311,3 @@ if not summary_df.empty:
     st.dataframe(styled, use_container_width=True, height=420)
 else:
     st.info("No markets selected.")
-
-# salam omidvaram halletoon khoob bashe
-#salam 2
