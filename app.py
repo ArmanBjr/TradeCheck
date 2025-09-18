@@ -141,6 +141,39 @@ def play_local_notification(title, body, repeat=3):
                 print(f"Error playing MP3: {e}")
         time.sleep(1)
 
+def evaluate_signal(token):
+    score = 0
+
+    # 1. EMA Cross
+    if token[f"EMA {ema_short}"] > token[f"EMA {ema_long}"]:
+        score += 2
+
+    # 2. RSI
+    if 50 <= token["RSI"] <= 70:
+        score += 1
+
+    # 3. MACD (optional: if you calculate it)
+    if "MACD" in token and "MACD Signal" in token:
+        if token["MACD"] > 0 and token["MACD"] > token["MACD Signal"]:
+            score += 2
+
+    # 4. Volume (optional if you track avg volume)
+    if "Volume" in token and "Avg Volume" in token:
+        if token["Volume"] > token["Avg Volume"]:
+            score += 1
+
+    # You can later extend with ATR, Stoch, Candle type, etc.
+
+    # Signal interpretation
+    if score >= 8:
+        strength = "strong ✅"
+    elif score >= 5:
+        strength = "mid ⚠️"
+    else:
+        strength = "weak ❌"
+
+    return score, strength
+
 # =================== UI ===================
 st.set_page_config(page_title="EMA Crossover Monitor", layout="wide")
 st.title("📋 EMA Crossover Monitor — Table View (CoinEx)")
@@ -262,6 +295,21 @@ for symbol in selected_markets:
                     # mark as seen so future reruns won't notify again
                     st.session_state["seen_crossovers"][key] = True
 
+        # compute percent change since last crossover (if any)
+        cross_price = None
+        change_pct = None
+        if cross:
+            cross_price = float(last_price)
+            if cross_price not in (None, 0):
+                change_pct = (last_close - cross_price) / cross_price * 100.0
+        score, strength = evaluate_signal({
+            "Symbol": symbol,
+            "Last Price": last_close,
+            f"EMA {ema_short}": ema_s,
+            f"EMA {ema_long}": ema_l,
+            "RSI": rsi,
+            # add more fields if you later calculate MACD, Volume, etc.
+        })
         records.append({
             "Symbol": symbol,
             "Last Price": last_close,
@@ -270,6 +318,13 @@ for symbol in selected_markets:
             "RSI": rsi,
             "Last Crossover": last_ts.strftime('%Y-%m-%d %H:%M') if last_ts else "-",
             "Type": last_type.title() if last_type != "-" else "-",
+            "Change Since Cross %": change_pct,
+
+            # NEW columns
+            "Score": score,
+            "Signal Strength": strength,
+
+            # backend fields
             "Alerts Sent": alerts_sent,
             "Status": status_flag,
             "Seen Before": "Yes" if (key and st.session_state["seen_crossovers"].get(key, False)) else "No",
@@ -279,35 +334,65 @@ for symbol in selected_markets:
 
 summary_df = pd.DataFrame(records)
 
-if not summary_df.empty:
+if summary_df.empty:
+    st.info("No markets selected.")
+else:
+    # row highlight (unchanged)
     def highlight_alert(row):
         if row.get("Status") == "ALERT":
             if row.get("Type") == "Bullish":
-                return ["background-color: #d4edda" for _ in row]  # green row
+                return ["background-color: #d4edda" for _ in row]
             if row.get("Type") == "Bearish":
-                return ["background-color: #f8d7da" for _ in row]  # red row
+                return ["background-color: #f8d7da" for _ in row]
         return ["" for _ in row]
 
+    # text colors
     def color_type_cell(v):
         if v == "Bullish":
-            return "color: #2ecc71; font-weight: 600;"  # green text
+            return "color: #2ecc71; font-weight: 600;"
         if v == "Bearish":
-            return "color: #e74c3c; font-weight: 600;"  # red text
+            return "color: #e74c3c; font-weight: 600;"
         return ""
 
+    def color_change_cell(v):
+        try:
+            if pd.isna(v):
+                return ""
+            if v > 0:
+                return "color: #2ecc71; font-weight: 600;"
+            if v < 0:
+                return "color: #e74c3c; font-weight: 600;"
+        except Exception:
+            pass
+        return ""
+
+    # columns to SHOW to the user (hide backend fields)
+    cols_to_show = [
+        "Symbol",
+        "Last Price",
+        f"EMA {ema_short}",
+        f"EMA {ema_long}",
+        "RSI",
+        "Last Crossover",
+        "Type",
+        "Change Since Cross %",
+        "Score",
+        "Signal Strength",
+    ]
+
     styled = (
-        summary_df
-            .style
-            .apply(highlight_alert, axis=1)               # row highlights
-            .applymap(color_type_cell, subset=["Type"])   # color only text in Type column
-            .format({
-                "Last Price": "{:.6f}",
-                f"EMA {ema_short}": "{:.6f}",
-                f"EMA {ema_long}": "{:.6f}",
-                "RSI": "{:.2f}",
-            })
+        summary_df[cols_to_show]
+        .style
+        .apply(highlight_alert, axis=1)
+        .applymap(color_type_cell, subset=["Type"])
+        .applymap(color_change_cell, subset=["Change Since Cross %"])
+        .format({
+            "Last Price": "{:.6f}",
+            f"EMA {ema_short}": "{:.6f}",
+            f"EMA {ema_long}": "{:.6f}",
+            "RSI": "{:.2f}",
+            "Change Since Cross %": "{:+.2f}%",
+        })
     )
 
     st.dataframe(styled, use_container_width=True, height=420)
-else:
-    st.info("No markets selected.")
