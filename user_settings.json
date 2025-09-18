@@ -5,11 +5,13 @@
     "BROCCOLIUSDT",
     "BOOPUSDT",
     "CAMPUSDT",
-    "ZEREBROUSDT"
+    "ZEREBROUSDT",
+    "MOVEUSDT",
+    "BRETTUSDT"
   ],
   "ema_short": 7,
   "ema_long": 30,
-  "interval": "5min",
+  "interval": "1min",
   "timezone": "Tehran",
   "notif_type": "Local",
   "notif_sound_repeat": 1,

@@ -11,6 +11,11 @@ import streamlit as st
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from streamlit_autorefresh import st_autorefresh
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import AverageTrueRange
+import numpy as np
+
 
 # =================== Persistence ===================
 SETTINGS_FILE = "user_settings.json"
@@ -23,6 +28,28 @@ def load_settings():
         except Exception:
             return {}
     return {}
+
+SEEN_FILE = "seen_crossovers.json"
+
+def _load_seen_from_disk():
+    try:
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_seen_to_disk(d):
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# init once
+if "seen_crossovers" not in st.session_state:
+    st.session_state["seen_crossovers"] = _load_seen_from_disk()
 
 def save_settings_from_state():
     settings = {
@@ -44,6 +71,185 @@ def save_settings_from_state():
         st.warning(f"Couldn't save settings: {e}")
 
 _saved = load_settings()
+
+# --- add full indicator set to a kline DataFrame (OHLCV, datetime index) ---
+def add_full_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # EMAs for strategy score (9/21) – independent from your table’s EMA_short/EMA_long
+    df["ema9"]  = EMAIndicator(df["close"], window=9).ema_indicator()
+    df["ema21"] = EMAIndicator(df["close"], window=21).ema_indicator()
+
+    # RSI(14)
+    df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
+
+    # MACD(12, 26, 9)
+    macd = MACD(close=df["close"], window_fast=12, window_slow=26, window_sign=9)
+    df["macd"]        = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+
+    # Volume avg (5)
+    df["avg_volume"] = df["volume"].rolling(5, min_periods=1).mean()
+
+    # ATR(14) + its rolling average (14)
+    atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14)
+    df["atr"]     = atr.average_true_range()
+    df["atr_avg"] = df["atr"].rolling(14, min_periods=1).mean()
+
+    # Stochastic %K / %D
+    stoch = StochasticOscillator(high=df["high"], low=df["low"], close=df["close"],
+                                 window=14, smooth_window=3)
+    df["stoch_k"] = stoch.stoch()
+    df["stoch_d"] = stoch.stoch_signal()
+
+    # Simple candle classifier (engulfing/pinbar/none)
+    df["candle_type"] = _detect_candle_type(df)
+
+    return df
+
+
+def _detect_candle_type(df: pd.DataFrame) -> pd.Series:
+    types = []
+    prev_o = df["open"].shift(1)
+    prev_c = df["close"].shift(1)
+
+    for o, h, l, c, po, pc in zip(df["open"], df["high"], df["low"], df["close"], prev_o, prev_c):
+        t = "none"
+        if pd.notna(po) and pd.notna(pc):
+            # bullish/bearish engulfing
+            if (c > o) and (pc < po) and (c >= po) and (o <= pc):
+                t = "engulfing_bull"
+            elif (c < o) and (pc > po) and (c <= po) and (o >= pc):
+                t = "engulfing_bear"
+        # pin bar (very small body vs total range, long tail)
+        body = abs(c - o)
+        rng  = h - l
+        if rng > 0:
+            upper = h - max(c, o)
+            lower = min(c, o) - l
+            if body / rng < 0.3 and (upper > 2 * body or lower > 2 * body):
+                t = "pinbar_bull" if lower > upper else "pinbar_bear"
+        types.append(t)
+
+    return pd.Series(types, index=df.index)
+
+
+def detect_trendline_pullback(df: pd.DataFrame, lookback: int = 40) -> dict:
+    """
+    Detects a simple pullback to a broken trendline in the last 3 candles.
+    Returns dict: {"label": "Bullish PB" | "Bearish PB" | "-", "price": float | None}
+    Logic:
+      - Fit a linear trendline on the last `lookback` closes.
+      - If slope > 0 (uptrend support):
+          break down on candle[-2], then candle[-1] retests near the line but closes BELOW candle[-2] -> Bearish PB
+        If slope < 0 (downtrend resistance):
+          break up on candle[-2], then candle[-1] retests near the line but closes ABOVE candle[-2] -> Bullish PB
+    """
+    if len(df) < lookback + 3:
+        return {"label": "-", "price": None}
+
+    seg = df.iloc[-(lookback+2):].copy()   # keep enough for prev/break/confirm
+    closes = seg["close"].values
+    x = np.arange(len(closes), dtype=float)
+
+    # Fit y = a*x + b
+    a, b = np.polyfit(x, closes, 1)
+    line_vals = a * x + b
+
+    # indexes for the last three candles within seg
+    i_prev     = len(seg) - 3
+    i_break    = len(seg) - 2
+    i_confirm  = len(seg) - 1
+
+    prev_c, break_o, break_c = closes[i_prev], seg["open"].iloc[i_break], closes[i_break]
+    conf_o, conf_c = seg["open"].iloc[i_confirm], closes[i_confirm]
+
+    line_prev   = line_vals[i_prev]
+    line_break  = line_vals[i_break]
+    line_confirm= line_vals[i_confirm]
+
+    # tolerance: small band around line, use ATR if available
+    try:
+        tol = float(seg["atr"].iloc[-1]) * 0.2
+        if not np.isfinite(tol) or tol <= 0:
+            raise Exception()
+    except Exception:
+        tol = float(closes[-1]) * 0.002  # ≈0.2%
+
+    label, price = "-", None
+
+    if a > 0:
+        # Uptrend support -> look for downward break then retest + continuation down
+        broke_down = (break_c < line_break) and (prev_c >= line_prev)
+        retest     = (abs(conf_o - line_confirm) <= tol) or (seg["high"].iloc[i_confirm] >= line_confirm - tol)
+        cont_down  = conf_c < break_c
+        if broke_down and retest and cont_down:
+            label, price = "Bearish PB", conf_c
+
+    elif a < 0:
+        # Downtrend resistance -> upward break then retest + continuation up
+        broke_up   = (break_c > line_break) and (prev_c <= line_prev)
+        retest     = (abs(conf_o - line_confirm) <= tol) or (seg["low"].iloc[i_confirm] <= line_confirm + tol)
+        cont_up    = conf_c > break_c
+        if broke_up and retest and cont_up:
+            label, price = "Bullish PB", conf_c
+
+    return {"label": label, "price": price}
+
+
+# --- pick the higher timeframe for a given interval ---
+def _higher_tf(interval: str) -> str:
+    mapping = {
+        "1min": "5min", "5min": "15min", "15min": "1hour",
+        "30min": "4hour", "1hour": "4hour", "4hour": "1day", "1day": "1day"
+    }
+    return mapping.get(interval, "15min")
+
+
+def get_higher_tf_trend(symbol: str, interval: str, tz) -> str:
+    hi = _higher_tf(interval)
+    df_h = get_kline_data(symbol, interval=hi, limit=200, _tz=tz)
+    df_h["ema9"]  = EMAIndicator(df_h["close"], 9).ema_indicator()
+    df_h["ema21"] = EMAIndicator(df_h["close"], 21).ema_indicator()
+    last = df_h.iloc[-1]
+    return "bullish" if last["ema9"] > last["ema21"] else "bearish"
+
+
+# --- final scoring (uses all indicators if present) ---
+def evaluate_signal_token(t: dict) -> tuple[int, str]:
+    score = 0
+
+    if t.get("ema_fast") is not None and t.get("ema_slow") is not None and t["ema_fast"] > t["ema_slow"]:
+        score += 2
+
+    # 2) RSI in sweet spot
+    if t.get("rsi") is not None and 50 <= t["rsi"] <= 70:
+        score += 1
+
+    # 3) MACD bullish (+ histogram rising via macd > signal)
+    if t.get("macd") is not None and t.get("macd_signal") is not None and t["macd"] > 0 and t["macd"] > t["macd_signal"]:
+        score += 2
+
+    # 4) Volume above recent average
+    if t.get("volume") is not None and t.get("avg_volume") is not None and t["volume"] > t["avg_volume"]:
+        score += 1
+
+    # 5) ATR in a “reasonable” range vs its average (0.8–1.5×)
+    if t.get("atr") and t.get("atr_avg") and (0.8 * t["atr_avg"] <= t["atr"] <= 1.5 * t["atr_avg"]):
+        score += 1
+
+    # 6) Stochastic bullish cross in oversold
+    if t.get("stoch_k") is not None and t.get("stoch_d") is not None and t["stoch_k"] > t["stoch_d"] and t["stoch_k"] < 30:
+        score += 1
+
+    # 7) Candle confirmation
+    if t.get("candle_type") in ("engulfing_bull", "pinbar_bull"):
+        score += 2
+
+    # 8) Higher-TF trend alignment
+    if t.get("highertf_trend") == "bullish":
+        score += 1
+
+    strength = "strong ✅" if score >= 8 else ("mid ⚠️" if score >= 5 else "weak ❌")
+    return score, strength
 
 # =================== App state ===================
 if "seen_crossovers" not in st.session_state:
@@ -141,38 +347,6 @@ def play_local_notification(title, body, repeat=3):
                 print(f"Error playing MP3: {e}")
         time.sleep(1)
 
-def evaluate_signal(token):
-    score = 0
-
-    # 1. EMA Cross
-    if token[f"EMA {ema_short}"] > token[f"EMA {ema_long}"]:
-        score += 2
-
-    # 2. RSI
-    if 50 <= token["RSI"] <= 70:
-        score += 1
-
-    # 3. MACD (optional: if you calculate it)
-    if "MACD" in token and "MACD Signal" in token:
-        if token["MACD"] > 0 and token["MACD"] > token["MACD Signal"]:
-            score += 2
-
-    # 4. Volume (optional if you track avg volume)
-    if "Volume" in token and "Avg Volume" in token:
-        if token["Volume"] > token["Avg Volume"]:
-            score += 1
-
-    # You can later extend with ATR, Stoch, Candle type, etc.
-
-    # Signal interpretation
-    if score >= 8:
-        strength = "strong ✅"
-    elif score >= 5:
-        strength = "mid ⚠️"
-    else:
-        strength = "weak ❌"
-
-    return score, strength
 
 # =================== UI ===================
 st.set_page_config(page_title="EMA Crossover Monitor", layout="wide")
@@ -261,12 +435,43 @@ recent_window  = pd.Timestamp.now(tz=selected_timezone) - pd.Timedelta(minutes=w
 for symbol in selected_markets:
     try:
         df = get_kline_data(symbol, interval=interval, limit=200, _tz=selected_timezone)
+        df = add_full_indicators(df)                                  # << add all indicators
+        last = df.iloc[-1]
+
+        # after fetching df
+        df = add_full_indicators(df)                 # keeps macd/rsi/stoch/... in df
+        df = calculate_emas(df, ema_short, ema_long) # adds EMA_short / EMA_long
+        pb = detect_trendline_pullback(df)               # <-- NEW
+        pullback_label = pb["label"]
+
+        # latest values
+        ema_s = float(df["EMA_short"].iloc[-1])
+        ema_l = float(df["EMA_long"].iloc[-1])
+
+        token_dict = {
+            "symbol": symbol,
+            "ema_fast": ema_s,                         # ← use the user-selected EMAs
+            "ema_slow": ema_l,                         # ← use the user-selected EMAs
+            "rsi":        float(df["rsi"].iloc[-1]),
+            "macd":       float(df["macd"].iloc[-1]),
+            "macd_signal":float(df["macd_signal"].iloc[-1]),
+            "volume":     float(df["volume"].iloc[-1]),
+            "avg_volume": float(df["avg_volume"].iloc[-1]),
+            "atr":        float(df["atr"].iloc[-1]),
+            "atr_avg":    float(df["atr_avg"].iloc[-1]),
+            "stoch_k":    float(df["stoch_k"].iloc[-1]),
+            "stoch_d":    float(df["stoch_d"].iloc[-1]),
+            "candle_type":      df["candle_type"].iloc[-1],
+            "highertf_trend":   get_higher_tf_trend(symbol, interval, selected_timezone),
+        }
+
+        score, strength = evaluate_signal_token(token_dict)  # ← now uses selected EMAs
         df = calculate_emas(df, ema_short, ema_long)
         cross = detect_crossovers(df)
 
         last_close = float(df["close"].iloc[-1])
-        ema_s = float(df["EMA_short"].iloc[-1])
-        ema_l = float(df["EMA_long"].iloc[-1])
+        # ema_s = float(df["EMA_short"].iloc[-1])
+        # ema_l = float(df["EMA_long"].iloc[-1])
         rsi   = float(df["RSI"].iloc[-1])
 
         last_ts = None
@@ -294,6 +499,10 @@ for symbol in selected_markets:
                         play_local_notification("📊 EMA Crossover Alert", msg, notif_sound_repeat)
                     # mark as seen so future reruns won't notify again
                     st.session_state["seen_crossovers"][key] = True
+                    # persist to disk
+                    _save_seen_to_disk(st.session_state["seen_crossovers"])
+
+
 
         # compute percent change since last crossover (if any)
         cross_price = None
@@ -302,14 +511,6 @@ for symbol in selected_markets:
             cross_price = float(last_price)
             if cross_price not in (None, 0):
                 change_pct = (last_close - cross_price) / cross_price * 100.0
-        score, strength = evaluate_signal({
-            "Symbol": symbol,
-            "Last Price": last_close,
-            f"EMA {ema_short}": ema_s,
-            f"EMA {ema_long}": ema_l,
-            "RSI": rsi,
-            # add more fields if you later calculate MACD, Volume, etc.
-        })
         records.append({
             "Symbol": symbol,
             "Last Price": last_close,
@@ -328,6 +529,8 @@ for symbol in selected_markets:
             "Alerts Sent": alerts_sent,
             "Status": status_flag,
             "Seen Before": "Yes" if (key and st.session_state["seen_crossovers"].get(key, False)) else "No",
+            "Pullback": pullback_label,
+
         })
     except Exception as e:
         st.error(f"Failed to load {symbol}: {e}")
@@ -337,55 +540,90 @@ summary_df = pd.DataFrame(records)
 if summary_df.empty:
     st.info("No markets selected.")
 else:
-    # row highlight (unchanged)
-    def highlight_alert(row):
-        if row.get("Status") == "ALERT":
-            if row.get("Type") == "Bullish":
-                return ["background-color: #d4edda" for _ in row]
-            if row.get("Type") == "Bearish":
-                return ["background-color: #f8d7da" for _ in row]
-        return ["" for _ in row]
+    # series we can reference by row.index in the styler
+    _status_s = summary_df["Status"].copy()
+    _type_s   = summary_df["Type"].copy()
 
-    # text colors
+    # def highlight_alert(row):
+    #     # use the outer series with row.name
+    #     if _status_s.loc[row.name] == "ALERT":
+    #         if _type_s.loc[row.name] == "Bullish":
+    #             return ["background-color: #d4edda" for _ in row]  # green
+    #         if _type_s.loc[row.name] == "Bearish":
+    #             return ["background-color: #f8d7da" for _ in row]  # red
+    #     return ["" for _ in row]
+
+
+    def color_last_price_by_change(row):
+        v = row.get("Change Since Cross %")
+        if pd.isna(v): return [""]
+        if v > 0:  return ["color: #2ecc71; font-weight: 600;"]
+        if v < 0:  return ["color: #e74c3c; font-weight: 600;"]
+        return [""]
+    
+    # cols_to_show = [
+    #     "Symbol", "Last Price", f"EMA {ema_short}", f"EMA {ema_long}",
+    #     "RSI", "Last Crossover", "Type", "Change Since Cross %",
+    #     "Score", "Signal Strength",
+    # ]
+
+    # display_df = summary_df[cols_to_show]  # no Status here
+
+    cols_to_show = [
+    "Symbol", "Last Price", f"EMA {ema_short}", f"EMA {ema_long}",
+    "RSI", "Last Crossover", "Type", "Change Since Cross %",
+    "Score", "Signal Strength", "Pullback",           # <-- NEW
+    ]
+
+    display_df = summary_df[cols_to_show]
+
+    def highlight_alert(row):
+        if _status_s.loc[row.name] == "ALERT":
+            if _type_s.loc[row.name] == "Bullish":
+                return ["background-color: #d4edda"] * len(display_df.columns)
+            if _type_s.loc[row.name] == "Bearish":
+                return ["background-color: #f8d7da"] * len(display_df.columns)
+        return [""] * len(display_df.columns)
+
     def color_type_cell(v):
-        if v == "Bullish":
-            return "color: #2ecc71; font-weight: 600;"
-        if v == "Bearish":
-            return "color: #e74c3c; font-weight: 600;"
+        if v == "Bullish": return "color:#2ecc71;font-weight:600;"
+        if v == "Bearish": return "color:#e74c3c;font-weight:600;"
         return ""
 
     def color_change_cell(v):
-        try:
-            if pd.isna(v):
-                return ""
-            if v > 0:
-                return "color: #2ecc71; font-weight: 600;"
-            if v < 0:
-                return "color: #e74c3c; font-weight: 600;"
-        except Exception:
-            pass
+        if pd.isna(v): return ""
+        if v > 0:  return "color:#2ecc71;font-weight:600;"
+        if v < 0:  return "color:#e74c3c;font-weight:600;"
         return ""
 
-    # columns to SHOW to the user (hide backend fields)
-    cols_to_show = [
-        "Symbol",
-        "Last Price",
-        f"EMA {ema_short}",
-        f"EMA {ema_long}",
-        "RSI",
-        "Last Crossover",
-        "Type",
-        "Change Since Cross %",
-        "Score",
-        "Signal Strength",
-    ]
+    # <<< KEY FIX: color Last Price based on the row's % change >>>
+    # index of Last Price column
+    _lp_idx = display_df.columns.get_loc("Last Price")
 
+    def color_last_price_row(row):
+        styles = [""] * len(display_df.columns)
+        v = row.get("Change Since Cross %")
+        if not pd.isna(v):
+            if v > 0:
+                styles[_lp_idx] = "color:#2ecc71;font-weight:700;font-size:24px;"
+            elif v < 0:
+                styles[_lp_idx] = "color:#e74c3c;font-weight:700;font-size:24px;"
+        return styles
+
+
+    def color_pullback_cell(v):
+        if v == "Bullish PB": return "color:#2ecc71;font-weight:700;"
+        if v == "Bearish PB": return "color:#e74c3c;font-weight:700;"
+        return ""
+    
     styled = (
-        summary_df[cols_to_show]
+        display_df
         .style
         .apply(highlight_alert, axis=1)
+        .apply(color_last_price_row, axis=1)
         .applymap(color_type_cell, subset=["Type"])
         .applymap(color_change_cell, subset=["Change Since Cross %"])
+        .applymap(color_pullback_cell, subset=["Pullback"])   # <-- NEW
         .format({
             "Last Price": "{:.6f}",
             f"EMA {ema_short}": "{:.6f}",
@@ -396,3 +634,4 @@ else:
     )
 
     st.dataframe(styled, use_container_width=True, height=420)
+
