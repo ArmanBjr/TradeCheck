@@ -439,6 +439,76 @@ interval  = st.selectbox(
     key="interval", on_change=save_settings_from_state
 )
 
+# ---------- Top table: TOTAL2, BTC, BTC.D, ETH, ETH.D ----------
+@st.cache_data(ttl=90, show_spinner=False)
+def ce_ticker(symbol: str):
+    r = requests.get("https://api.coinex.com/v1/market/ticker",
+                     params={"market": symbol}, timeout=15)
+    r.raise_for_status()
+    t = r.json()["data"]["ticker"]
+    last = float(t["last"])
+    open_ = float(t["open"])
+    abs_ = last - open_
+    pct = (abs_ / open_ * 100.0) if open_ else None
+    return {"last": last, "abs": abs_, "pct": pct}
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cg_global():
+    r = requests.get("https://api.coingecko.com/api/v3/global", timeout=15)
+    r.raise_for_status()
+    return r.json()["data"]
+
+def _money(x):
+    return "-" if x is None else f"${x:,.2f}"
+
+def _pct_str(x):
+    return "-" if x is None else f"{x:+.2f}%"
+
+try:
+    g = cg_global()
+    total_mcap = float(g["total_market_cap"]["usd"])
+    btc_dom = float(g["market_cap_percentage"]["btc"])      # BTC.D
+    eth_dom = float(g["market_cap_percentage"]["eth"])      # ETH.D
+    total_pct_24h = float(g.get("market_cap_change_percentage_24h_usd", 0.0))
+
+    total2_mcap = total_mcap * (1 - btc_dom/100.0)          # TOTAL2 ≈ TOTAL ex-BTC
+    total2_abs_24h = total2_mcap * (total_pct_24h/100.0)
+
+    btc = ce_ticker("BTCUSDT")
+    eth = ce_ticker("ETHUSDT")
+
+    # Build the small table
+    top_tbl = pd.DataFrame([
+        ["TOTAL2",  _money(total2_mcap),  _money(total2_abs_24h),  total_pct_24h],
+        ["BTCUSDT", _money(btc["last"]),  _money(btc["abs"]),     btc["pct"]],
+        ["BTC.D",   f"{btc_dom:.2f}%",    "-",                     None],
+        ["ETHUSDT", _money(eth["last"]),  _money(eth["abs"]),     eth["pct"]],
+        ["ETH.D",   f"{eth_dom:.2f}%",    "-",                     None],
+    ], columns=["Asset", "Last", "Δ 24h", "Δ% 24h"])
+
+    def _color_pct(v):
+        if v is None: return ""
+        if v > 0:  return "color:#2ecc71;font-weight:600;"
+        if v < 0:  return "color:#e74c3c;font-weight:600;"
+        return ""
+
+    styled_top = (
+        top_tbl
+        .style
+        .map(_color_pct, subset=["Δ% 24h"])
+        .format({"Δ% 24h": _pct_str})
+    )
+
+    st.dataframe(
+        styled_top,
+        use_container_width=True,
+        hide_index=True,
+        height=180,
+    )
+
+except Exception as e:
+    st.warning(f"Top metrics unavailable: {e}")
+
 # =================== Table (no charts) ===================
 records = []
 
