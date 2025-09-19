@@ -131,68 +131,80 @@ def _detect_candle_type(df: pd.DataFrame) -> pd.Series:
 
     return pd.Series(types, index=df.index)
 
+def _pullback_state_from_parts(trend_slope, broke, retested, confirmed):
+    if abs(trend_slope) < 1e-12:
+        return "No trend"
+    if not broke:
+        return "Trend, no break"
+    if broke and not retested:
+        return "Break, waiting retest"
+    if broke and retested and not confirmed:
+        return "Retest, waiting confirm"
+    return "—"  # should not happen, covered by main positive labels
 
-def detect_trendline_pullback(df: pd.DataFrame, lookback: int = 40) -> dict:
-    """
-    Detects a simple pullback to a broken trendline in the last 3 candles.
-    Returns dict: {"label": "Bullish PB" | "Bearish PB" | "-", "price": float | None}
-    Logic:
-      - Fit a linear trendline on the last `lookback` closes.
-      - If slope > 0 (uptrend support):
-          break down on candle[-2], then candle[-1] retests near the line but closes BELOW candle[-2] -> Bearish PB
-        If slope < 0 (downtrend resistance):
-          break up on candle[-2], then candle[-1] retests near the line but closes ABOVE candle[-2] -> Bullish PB
-    """
+def _detect_pullback_once(df: pd.DataFrame, lookback: int, tol_mult: float):
     if len(df) < lookback + 3:
-        return {"label": "-", "price": None}
+        return {"label": "Too short", "price": None, "score": 0, "parts": (0,0,0), "slope": 0.0}
 
-    seg = df.iloc[-(lookback+2):].copy()   # keep enough for prev/break/confirm
-    closes = seg["close"].values
+    seg = df.iloc[-(lookback+2):].copy()
+    closes = seg["close"].to_numpy()
     x = np.arange(len(closes), dtype=float)
 
-    # Fit y = a*x + b
-    a, b = np.polyfit(x, closes, 1)
-    line_vals = a * x + b
+    a, b = np.polyfit(x, closes, 1)             # trendline y = a x + b
+    line = a * x + b
 
-    # indexes for the last three candles within seg
-    i_prev     = len(seg) - 3
-    i_break    = len(seg) - 2
-    i_confirm  = len(seg) - 1
+    i_prev, i_break, i_conf = len(seg)-3, len(seg)-2, len(seg)-1
+    prev_c, break_c, conf_c = closes[i_prev], closes[i_break], closes[i_conf]
+    line_prev, line_break, line_conf = line[i_prev], line[i_break], line[i_conf]
 
-    prev_c, break_o, break_c = closes[i_prev], seg["open"].iloc[i_break], closes[i_break]
-    conf_o, conf_c = seg["open"].iloc[i_confirm], closes[i_confirm]
-
-    line_prev   = line_vals[i_prev]
-    line_break  = line_vals[i_break]
-    line_confirm= line_vals[i_confirm]
-
-    # tolerance: small band around line, use ATR if available
+    # tolerance (ATR-based if possible, else 0.2%)
     try:
-        tol = float(seg["atr"].iloc[-1]) * 0.2
-        if not np.isfinite(tol) or tol <= 0:
-            raise Exception()
+        atr_last = float(seg["atr"].iloc[-1])
+        tol = atr_last * tol_mult if np.isfinite(atr_last) and atr_last > 0 else float(closes[-1]) * 0.002
     except Exception:
-        tol = float(closes[-1]) * 0.002  # ≈0.2%
+        tol = float(closes[-1]) * 0.002
 
-    label, price = "-", None
-
+    # parts
     if a > 0:
-        # Uptrend support -> look for downward break then retest + continuation down
-        broke_down = (break_c < line_break) and (prev_c >= line_prev)
-        retest     = (abs(conf_o - line_confirm) <= tol) or (seg["high"].iloc[i_confirm] >= line_confirm - tol)
-        cont_down  = conf_c < break_c
-        if broke_down and retest and cont_down:
-            label, price = "Bearish PB", conf_c
+        broke     = (break_c < line_break) and (prev_c >= line_prev)
+        retested  = (abs(seg["open"].iloc[i_conf] - line_conf) <= tol) or (seg["high"].iloc[i_conf] >= line_conf - tol)
+        confirmed = conf_c <= break_c
+        if broke and retested and confirmed:
+            return {"label": "Bearish PB", "price": conf_c, "score": 3, "parts": (1,1,1), "slope": a}
+        return {"label": _pullback_state_from_parts(a, broke, retested, confirmed),
+                "price": None, "score": int(broke)+int(retested)+int(confirmed), "parts": (broke, retested, confirmed), "slope": a}
 
     elif a < 0:
-        # Downtrend resistance -> upward break then retest + continuation up
-        broke_up   = (break_c > line_break) and (prev_c <= line_prev)
-        retest     = (abs(conf_o - line_confirm) <= tol) or (seg["low"].iloc[i_confirm] <= line_confirm + tol)
-        cont_up    = conf_c > break_c
-        if broke_up and retest and cont_up:
-            label, price = "Bullish PB", conf_c
+        broke     = (break_c > line_break) and (prev_c <= line_prev)
+        retested  = (abs(seg["open"].iloc[i_conf] - line_conf) <= tol) or (seg["low"].iloc[i_conf] <= line_conf + tol)
+        confirmed = conf_c >= break_c
+        if broke and retested and confirmed:
+            return {"label": "Bullish PB", "price": conf_c, "score": 3, "parts": (1,1,1), "slope": a}
+        return {"label": _pullback_state_from_parts(a, broke, retested, confirmed),
+                "price": None, "score": int(broke)+int(retested)+int(confirmed), "parts": (broke, retested, confirmed), "slope": a}
 
-    return {"label": label, "price": price}
+    else:
+        return {"label": "No trend", "price": None, "score": 0, "parts": (0,0,0), "slope": a}
+
+def detect_trendline_pullback_any(df: pd.DataFrame,
+                                  lookbacks=(20, 35, 50),
+                                  tol_mult: float = 0.25) -> dict:
+    """
+    Try several lookbacks; return the first confirmed PB if any.
+    Otherwise return the 'best partial' state so the column is never '-'.
+    """
+    best = {"label": "No trend", "price": None, "score": -1, "parts": (0,0,0), "slope": 0.0}
+    for lb in lookbacks:
+        res = _detect_pullback_once(df, lb, tol_mult)
+        # immediate return on a full signal
+        if res["label"] in ("Bullish PB", "Bearish PB"):
+            return res
+        # keep the best partial (highest parts score)
+        if res["score"] > best["score"]:
+            best = res
+    return best
+
+
 
 
 # --- pick the higher timeframe for a given interval ---
@@ -363,6 +375,13 @@ selected_tz_label = st.selectbox(
     key="selected_tz_label",
     on_change=save_settings_from_state
 )
+# --- Pullback tuning knobs ---
+colPB1, colPB2 = st.columns(2)
+with colPB1:
+    pb_lookback = st.slider("Pullback lookback", 15, 80, 30, key="pb_lookback")
+with colPB2:
+    pb_tol_mult = st.slider("Pullback tol (ATR×)", 0.05, 0.50, 0.25, step=0.05, key="pb_tol_mult")
+
 selected_timezone = pytz.timezone(timezones[selected_tz_label])
 now_local = pd.Timestamp.now(tz=selected_timezone)
 st.markdown(f"**🕒 Current time ({selected_tz_label})**: {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -439,10 +458,13 @@ for symbol in selected_markets:
         last = df.iloc[-1]
 
         # after fetching df
-        df = add_full_indicators(df)                 # keeps macd/rsi/stoch/... in df
+        # df = add_full_indicators(df)                 # keeps macd/rsi/stoch/... in df
         df = calculate_emas(df, ema_short, ema_long) # adds EMA_short / EMA_long
-        pb = detect_trendline_pullback(df)               # <-- NEW
+        pb = detect_trendline_pullback_any(df, lookbacks=(pb_lookback, max(15, pb_lookback-15), min(80, pb_lookback+15)),
+                                        tol_mult=pb_tol_mult)
         pullback_label = pb["label"]
+
+
 
         # latest values
         ema_s = float(df["EMA_short"].iloc[-1])
@@ -614,16 +636,19 @@ else:
     def color_pullback_cell(v):
         if v == "Bullish PB": return "color:#2ecc71;font-weight:700;"
         if v == "Bearish PB": return "color:#e74c3c;font-weight:700;"
+        if v in ("Break, waiting retest", "Retest, waiting confirm"): return "color:#f1c40f;font-weight:600;"
+        if v in ("Trend, no break", "No trend", "Too short"): return "color:#bdc3c7;"
         return ""
+
     
     styled = (
         display_df
         .style
         .apply(highlight_alert, axis=1)
         .apply(color_last_price_row, axis=1)
-        .applymap(color_type_cell, subset=["Type"])
-        .applymap(color_change_cell, subset=["Change Since Cross %"])
-        .applymap(color_pullback_cell, subset=["Pullback"])   # <-- NEW
+        .map(color_type_cell, subset=["Type"])                      # <- was applymap
+        .map(color_change_cell, subset=["Change Since Cross %"])    # <- was applymap
+        .map(color_pullback_cell, subset=["Pullback"])              # <- was applymap
         .format({
             "Last Price": "{:.6f}",
             f"EMA {ema_short}": "{:.6f}",
@@ -632,6 +657,7 @@ else:
             "Change Since Cross %": "{:+.2f}%",
         })
     )
+
 
     st.dataframe(styled, use_container_width=True, height=420)
 

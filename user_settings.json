@@ -1,20 +1,16 @@
 {
   "selected_markets": [
-    "SEIBTC",
-    "CWIFUSDT",
-    "BROCCOLIUSDT",
-    "BOOPUSDT",
-    "CAMPUSDT",
-    "ZEREBROUSDT",
-    "MOVEUSDT",
-    "BRETTUSDT"
+    "A2ZUSDT",
+    "BRETTUSDT",
+    "AIGUSDT",
+    "BTCUSDT"
   ],
   "ema_short": 7,
   "ema_long": 30,
-  "interval": "1min",
+  "interval": "5min",
   "timezone": "Tehran",
   "notif_type": "Local",
-  "notif_sound_repeat": 1,
+  "notif_sound_repeat": 3,
   "max_alerts_per_cross": 2,
-  "refresh_minutes": 2
+  "refresh_minutes": 5
 }
