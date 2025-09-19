@@ -1,1 +1,1 @@
-pip install streamlit requests pandas ta plotly streamlit-autorefresh plyer pygame
+pip install streamlit requests pandas ta plotly streamlit-autorefresh plyer pygame numpy
